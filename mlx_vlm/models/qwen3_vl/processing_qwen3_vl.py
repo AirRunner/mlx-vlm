@@ -219,4 +219,4 @@ __all__ = ["Qwen3VLProcessor"]
 
 from ..base import install_auto_processor_patch
 
-install_auto_processor_patch("qwen3_vl", Qwen3VLProcessor)
+install_auto_processor_patch(["qwen3_vl", "qwen3_5", "qwen3_5_moe"], Qwen3VLProcessor)
