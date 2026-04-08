@@ -28,6 +28,7 @@ QUANT_RECIPES = [
     "mixed_3_8",
     "mixed_4_6",
     "mixed_4_8",
+    "moe_3_8",
 ]
 
 
@@ -44,6 +45,7 @@ def mixed_quant_predicate_builder(
         "mixed_3_8": (3, 8),
         "mixed_4_6": (4, 6),
         "mixed_4_8": (4, 8),
+        "moe_3_8": (3, 8),
     }
 
     if recipe not in recipe_config:
@@ -84,6 +86,29 @@ def mixed_quant_predicate_builder(
             element = path_parts[layer_location]
             if element.isdigit():
                 index = int(element)
+
+        if recipe == "moe_3_8":
+            # MoE router, shared expert gate: full precision.
+            # Tiny modules, highly sensitive to quantization error.
+            if path.endswith(".gate") or path.endswith(".shared_expert_gate"):
+                return False
+            # GDN/SSM linear projections: 8-bit.
+            # Non-linear SSM states (conv1d, norms, ssm_a) are not nn.Linear
+            # and are excluded by the hasattr check above.
+            if "linear_attn" in path:
+                return {"group_size": group_size, "bits": 8}
+            # Attention, shared expert, lm_head, embeddings: 8-bit.
+            if (
+                "mlp.shared_expert." in path
+                or "self_attn" in path
+                or "lm_head" in path
+                or "embed_tokens" in path
+            ):
+                return {"group_size": group_size, "bits": 8}
+            # Routed experts (switch_mlp): down_proj at 4-bit, gate/up at 3-bit.
+            if "switch_mlp" in path and "down_proj" in path:
+                return {"group_size": group_size, "bits": 4}
+            return {"group_size": group_size, "bits": low_bits}
 
         use_more_bits = (
             index < num_layers // 8
