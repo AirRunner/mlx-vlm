@@ -106,9 +106,6 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
-        # ignore mtp weights
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
-
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
@@ -118,6 +115,9 @@ class Model(Qwen3VLModel):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
 
         sanitized_weights = {}
@@ -129,6 +129,8 @@ class Model(Qwen3VLModel):
                     key = key.replace("model.visual", "vision_tower")
             elif "lm_head" in key:
                 key = key.replace("lm_head", "language_model.lm_head")
+            elif key.startswith("mtp."):
+                key = f"language_model.{key}"
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)

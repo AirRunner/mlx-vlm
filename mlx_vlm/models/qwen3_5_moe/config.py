@@ -52,6 +52,7 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
 
     def __post_init__(self):
         if self.rope_parameters:
@@ -61,6 +62,9 @@ class TextConfig(BaseModelConfig):
                 and "rope_type" in self.rope_parameters
             ):
                 self.rope_parameters["type"] = self.rope_parameters.pop("rope_type")
+            self.partial_rotary_factor: float = self.rope_parameters.get(
+                "partial_rotary_factor", 0.25
+            )
 
             required_keys = {
                 "mrope_section",

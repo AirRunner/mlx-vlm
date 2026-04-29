@@ -389,6 +389,62 @@ class Qwen3_5DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+class MTPDecoderLayer(nn.Module):
+    """Full-attention transformer layer for the MTP head (no GatedDeltaNet)."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.self_attn = Qwen3_5Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MTPModule(nn.Module):
+    """Multi-Token Prediction head (Qwen3.5 native speculative decoding)."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens: nn.Embedding,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(embeds)
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(fused, cache[0])
+        for layer, c in zip(self.layers, cache):
+            fused = layer(fused, mask, c)
+
+        return self.norm(fused)
+
+
 class Qwen3_5Model(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -446,6 +502,8 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args)
 
     def rollback_speculative_cache(
         self,
@@ -855,14 +913,18 @@ class LanguageModel(nn.Module):
     @property
     def quant_predicate(self):
 
-        if getattr(self.args, "num_experts", 0) <= 0:
-            return None
-
         def predicate(path, _):
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
+            if path.endswith("mtp.fc"):
+                return False
             return True
 
+        if (
+            getattr(self.args, "num_experts", 0) <= 0
+            and self.args.mtp_num_hidden_layers <= 0
+        ):
+            return None
         return predicate
 
     @property

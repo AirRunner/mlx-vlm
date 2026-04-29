@@ -5,6 +5,7 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
+from ..qwen3_5.language import MTPModule
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
 from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
@@ -47,6 +48,43 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
         return y + shared_y
+
+
+class MoEMTPDecoderLayer(nn.Module):
+    """Full-attention MTP decoder layer using the MoE MLP block."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.self_attn = Qwen3_5MoeAttention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = Qwen3_5MoeSparseMoeBlock(args)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MoEMTPModule(MTPModule):
+    """MTP head using MoE MLP layers instead of dense MLP."""
+
+    def __init__(self, args: TextConfig):
+        nn.Module.__init__(self)
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [
+            MoEMTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
 
 class Qwen3_5MoeDecoderLayer(nn.Module):
@@ -111,3 +149,5 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MoEMTPModule(args)
