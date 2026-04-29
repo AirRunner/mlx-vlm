@@ -7,6 +7,31 @@ from .language import LanguageModel
 from .vision import VisionModel
 
 
+def _unfuse_experts(weights, prefix):
+    """Split fused gate_up_proj into per-projection switch_mlp weights (Qwen3.6 format)."""
+    gate_up_key = f"{prefix}.experts.gate_up_proj"
+    if gate_up_key not in weights:
+        return
+    gate_up = weights.pop(gate_up_key)
+    mid = gate_up.shape[-2] // 2
+    weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
+    weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
+    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+        f"{prefix}.experts.down_proj"
+    )
+
+
+def _stack_per_expert(weights, prefix, num_experts):
+    """Stack per-expert weights into switch_mlp format (Qwen3.5 format)."""
+    for n in ("gate_proj", "up_proj", "down_proj"):
+        weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
+            [
+                weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                for e in range(num_experts)
+            ]
+        )
+
+
 class Model(Qwen3_5Model):
 
     def __init__(self, config: ModelConfig):
@@ -20,41 +45,22 @@ class Model(Qwen3_5Model):
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
+        # Backbone MoE layers always use fused gate_up_proj.
         for l in range(self.config.text_config.num_hidden_layers):
-            prefix = f"model.language_model.layers.{l}.mlp"
-            # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
-            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            # down_proj
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                f"{prefix}.experts.down_proj"
-            )
+            _unfuse_experts(weights, f"model.language_model.layers.{l}.mlp")
 
+        # MTP layers: fused format (Qwen3.6) or per-expert format (Qwen3.5).
+        # Detect format once from the first layer and apply uniformly.
         mtp_num = self.config.text_config.mtp_num_hidden_layers
-        num_experts = self.config.text_config.num_experts
-        for layer_idx in range(mtp_num):
-            prefix = f"mtp.layers.{layer_idx}.mlp"
-            gate_up = weights.pop(f"{prefix}.experts.gate_up_proj", None)
-            if gate_up is not None:
-                # Fused format (Qwen3.6): gate_up_proj [num_experts, 2*intermediate, hidden]
-                mid = gate_up.shape[-2] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.experts.down_proj"
-                )
-            elif f"{prefix}.experts.0.gate_proj.weight" in weights:
-                # Per-expert format (Qwen3.5): stack individual expert weights
-                for n in ["gate_proj", "up_proj", "down_proj"]:
-                    stacked = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                            for e in range(num_experts)
-                        ]
-                    )
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = stacked
+        if mtp_num > 0:
+            num_experts = self.config.text_config.num_experts
+            mtp_is_fused = "mtp.layers.0.mlp.experts.gate_up_proj" in weights
+            for layer_idx in range(mtp_num):
+                prefix = f"mtp.layers.{layer_idx}.mlp"
+                if mtp_is_fused:
+                    _unfuse_experts(weights, prefix)
+                else:
+                    _stack_per_expert(weights, prefix, num_experts)
 
         norm_keys = (
             ".input_layernorm.weight",
